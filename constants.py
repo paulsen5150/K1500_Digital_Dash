@@ -33,7 +33,7 @@ glow_state = False
 speed_status = 55
 tach_status = 1700
 fuel_status = 73
-coolant_status = 198
+coolant_status = 0
 voltage_status = 14.2
 oil_status = 54
 
@@ -72,7 +72,7 @@ COOLANT_XY =(170, 215)
 VOLTAGE_XY = (925, 215)
 OIL_XY = (170, 75)
 OIL_LABEL_XY = (60, 25)
-COOLANT_LABEL_XY = (60, 162)
+COOLANT_LABEL_XY = (40, 162)
 VOLTAGE_LABEL_XY = (835, 162)
 FUEL_LABEL_XY = (815, 25)
 SPEED_LABEL_XY = (560, 10)

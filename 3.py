@@ -1,11 +1,12 @@
 #! /usr/bin/python3
-# VERSION 0.2 Compacted code using classes
+# VERSION 0.3 Adding MQTT polling
 # kate: indent-pasted-text false; indent-width 4;
 # import pygame module
 import pygame
 import random
 from constants import *
 from functions import *
+import paho.mqtt.client as mqttClient
 
 #backGround = pygame.image.load('Images/splash2.png')
 #backGround = pygame.transform.scale(backGround, (window_width, window_height))
@@ -24,7 +25,7 @@ fontObj2 = pygame.font.Font(None, 50)
 #Object initializing
 oil = DigitalGauge(oil_status, 'Oil Pressure', OIL_XY, digital_font, fontObj, OIL_LABEL_XY)
 voltage = DigitalGauge(voltage_status, 'Battery', VOLTAGE_XY, digital_font, fontObj, VOLTAGE_LABEL_XY)
-coolant = DigitalGauge(coolant_status, 'Temprature', COOLANT_XY, digital_font, fontObj, COOLANT_LABEL_XY)
+coolant = DigitalGauge(coolant_status, 'Temperature', COOLANT_XY, digital_font, fontObj, COOLANT_LABEL_XY)
 fuel = DigitalGauge(fuel_status, 'Fuel Level', FUEL_XY, digital_font, fontObj, FUEL_LABEL_XY)
 speed = DigitalGauge(speed_status,'MPH', SPEEDO_XY, font_speedunits, fontObj, SPEED_LABEL_XY, AMBER)
 tach = DigitalGauge(tach_status,'RPM', RPM_XY, font_tachunits, fontObj, TACH_LABEL_XY, AMBER)
@@ -36,6 +37,38 @@ tach = DigitalGauge(tach_status,'RPM', RPM_XY, font_tachunits, fontObj, TACH_LAB
 #     image = pygame.image.load(("indicators/ind" + str(i) + ".png")).convert()
 #     image_small = pygame.transform.scale(image, resize_scaleXY)
 #     indicator_images.append(image_small)
+
+######
+#       MQTT Connection Function
+######
+
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        print("Connected to broker with on_connect")
+        global Connected  # Use global variable
+        Connected = True  # Signal connection
+    else: print("Connection failed")
+
+
+def on_message(client, userdata, message):
+     #print("made it here wiht on_message")
+     print(message.topic + " on_message " + message.payload.decode())
+
+
+######
+#       ENGINE TOPIC MQTT
+######
+#def on_message(digi, obj, message):
+def on_message_coolant(digi, obj, message):
+    global coolant_status
+    coolant_status = str(int(message.payload.decode()[0:2]) + 170)
+    coolant.draw(coolant_status)
+
+def on_message_oil(digi, obj, message):
+    global oil_status
+    oil_status = str(int(message.payload.decode()[0:2]) * 3)
+    oil.draw(oil_status)
 
 #   Creating the list for the indicator gauges
 indicator_images = []
@@ -95,21 +128,41 @@ def draw_gauge_panel():
 #    draw_speedometer_text()
 #    draw_tach_text()
     draw_labels()
-    oil.draw()
-    voltage.draw()
-    coolant.draw()
-    fuel.draw()
-    tach.draw()
-    speed.draw()
+    oil.draw(oil_status)
+    voltage.draw(voltage_status)
+    coolant.draw(coolant_status)
+    fuel.draw(fuel_status)
+    tach.draw(tach_status)
+    speed.draw(speed_status)
 
 # Creating a bool value which checks if 
 # game is running
 running = True
 fullscreen = False
 
+#   MQTT Variables
+broker_address = "test.mosquitto.org"  # Broker address
+port = 1883  # Broker port
+client = mqttClient.Client()  # create new instance
+print(client.on_message)
+client.on_connect = on_connect  # attach function to callback
+client.on_message = on_message  # attach function to callback
+client.connect(broker_address, port=port)  # connect to broker
+#client.subscribe("sensor/Temperature")
+#client.loop_forever()
+client.loop_start()  # start the loop
+
 # Keep game running till running is true
 while running:
-	
+    
+    #   MQTT Call backs... putting values in from topics
+    
+	#print(client.on_message)
+	client.message_callback_add('sensor/temperature', on_message_coolant)
+#	client.message_callback_add('sensor/temperature', on_message_oil)
+	#client.message_callback('sensor/Temperature#')
+	client.subscribe("sensor/temperature")
+#client.on_message()
 	# Check for event if user has pushed 
 	# any event in queue
 	for event in pygame.event.get():

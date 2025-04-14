@@ -2,7 +2,7 @@ from constants import *
 
 class DigitalGauge:
     def __init__(self, status, label, positionXY, font, label_font, label_XY, textColor = GREEN, labelTextcolor = TEXTCOLOUR):
-        self.status = status
+        #self.status = status
         self.label = label
         self.position = positionXY
         self.font = font
@@ -11,7 +11,8 @@ class DigitalGauge:
         self.textColor = textColor
         self.labelTextcolor = labelTextcolor
         
-    def draw(self):
+    def draw(self, status):
+        self.status = status
         if self.label == 'Battery':
             self.text = self.font.render(str(float(self.status)), True, self.textColor)
         else:

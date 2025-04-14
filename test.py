@@ -1,25 +1,21 @@
-#test.py
-from functions import *
-import pygame
-from constants import *
+#!/usr/bin/python3
+import paho.mqtt.client as mqtt
 
-pygame.init()
+broker_url = "test.mosquitto.org"
+broker_port = 1883
 
-digital_font = pygame.font.Font(FONT_PATH, FONT_MEDIUM)
-fontObj = pygame.font.Font(None, 32)
-oil = DigitalGauge(44, 'Oil Pressure', OIL_XY, digital_font, fontObj)
+def on_connect(client, userdata, flags, rc):
+   print("Connected With Result Code Nu", rc)
 
-# print (oil.status)
-# print (oil.textColor)
-# print (oil.label)
-# print (oil.labelTextcolor)
-# print(oil.position)
+def on_message(client, userdata, message):
+   print("Message Recieved: is"+message.payload.decode())
 
-running = True
-while running:
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
-    oil.draw()
-    pygame.display.update()
+client = mqtt.Client()
+client.on_connect = on_connect
+client.on_message = on_message
+client.connect(broker_url, broker_port)
+client.subscribe("sensor/temperature", qos=1)
 
+#client.publish(topic="TestingTopic", payload="TestingPayload", qos=1, retain=False)
+
+client.loop_forever()
