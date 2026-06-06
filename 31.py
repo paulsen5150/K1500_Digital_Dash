@@ -12,6 +12,7 @@ from functions31 import *
 import json
 import os
 import serial
+import ast
 from serial import SerialException
 
 #backGround = pygame.image.load('Images/splash2.png')
@@ -108,13 +109,18 @@ def read_serial_dash_state():
 
     try:
         line = raw_line.decode("utf-8").strip()
-        dash_state = json.loads(line)
     except UnicodeDecodeError:
         print("Bad serial encoding:", raw_line)
         return
+
+    try:
+        dash_state = json.loads(line)
     except json.JSONDecodeError:
-        print("Bad JSON:", raw_line)
-        return
+        try:
+            dash_state = ast.literal_eval(line)
+        except (SyntaxError, ValueError):
+            print("Bad JSON:", line)
+            return
 
     if not isinstance(dash_state, dict):
         print("Bad dash packet:", dash_state)
