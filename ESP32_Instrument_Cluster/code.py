@@ -7,6 +7,7 @@ This version keeps the hardware setup from ESP32_KITT_Display/code.py, but the
 default page is a landscape digital instrument cluster with speed, RPM, analog
 gauges, warning lamps, PRNDL, and an integer-backed odometer.
 """
+import gc
 import json
 import time
 
@@ -18,7 +19,6 @@ import terminalio
 from adafruit_display_text import label
 import adafruit_ads1x15.ads1115 as ADS
 from adafruit_ads1x15.analog_in import AnalogIn
-import adafruit_pcf8574
 import adafruit_st7789
 import fourwire
 
@@ -45,15 +45,28 @@ PAGE_BUTTON_PIN = board.IO17
 VSS_PIN = board.IO15
 TACH_PIN = board.IO16
 
+#COMMENTED OUT FOR DEBUGGING 06/06/2026
+#REVERTED TO ORIGINAL 06/07/2026
 PCF_POLL_INTERVAL = 0.05
 ADS_POLL_INTERVAL = 0.2
 PULSE_POLL_INTERVAL = 0.001
 DISPLAY_INTERVAL = 0.1
+TEXT_DISPLAY_INTERVAL = 0.5
 SERIAL_INTERVAL = 1.0
+
 BUTTON_DEBOUNCE = 0.05
 FREQUENCY_WINDOW = 1.0
 STALE_PULSE_SECONDS = 2.0
 ENGINE_OFF_TACH_STALE_SECONDS = 5.0
+
+#TIMING CHANGED FOR DEBUGGING 06/06/2026
+#REVERTED TO ORIGINAL 06/07/2026
+# SERIAL_INTERVAL = 10.0
+# DISPLAY_INTERVAL = 0.5
+# TEXT_DISPLAY_INTERVAL = 1.0
+# PCF_POLL_INTERVAL = 0.2
+# ADS_POLL_INTERVAL = 0.5
+# PULSE_POLL_INTERVAL = 0.01
 
 
 # Calibration placeholders. Adjust these after road/bench testing.
@@ -72,6 +85,24 @@ MAX_SENDER_OHMS = 90.0
 MAX_OIL_PSI = 80.0
 MAX_COOLANT_F = 260.0
 
+GM_ECT_TABLE = (
+    (-40.0, 100700.0),
+    (-22.0, 52700.0),
+    (-4.0, 28680.0),
+    (14.0, 16180.0),
+    (32.0, 9420.0),
+    (50.0, 5670.0),
+    (68.0, 3520.0),
+    (86.0, 2238.0),
+    (104.0, 1459.0),
+    (122.0, 973.0),
+    (140.0, 667.0),
+    (158.0, 467.0),
+    (176.0, 332.0),
+    (194.0, 241.0),
+    (212.0, 177.0),
+)
+
 LOW_FUEL_PERCENT = 12.5
 LOW_OIL_PSI = 5.0
 HIGH_COOLANT_F = 230.0
@@ -88,10 +119,10 @@ COLOR_BLUE = 0x2080FF
 
 
 INDICATOR_SIGNALS = (
-    {"name": "HiBeam", "bit": 0, "active_high": True},
-    {"name": "L Turn", "bit": 1, "active_high": True},
-    {"name": "R Turn", "bit": 2, "active_high": True},
-    {"name": "SeatBelts", "bit": 3, "active_high": True},
+    {"name": "HiBeam", "bit": 0, "active_high": False},
+    {"name": "L Turn", "bit": 1, "active_high": False},
+    {"name": "R Turn", "bit": 2, "active_high": False},
+    {"name": "SeatBelts", "bit": 3, "active_high": False},
     {"name": "PRNDL P", "bit": 4, "active_high": True},
     {"name": "PRNDL C", "bit": 5, "active_high": True},
     {"name": "PRNDL B", "bit": 6, "active_high": True},
@@ -155,17 +186,43 @@ def init_i2c():
     return i2c_bus, found
 
 
+class DirectPCF8574:
+    def __init__(self, i2c_bus, address):
+        self.i2c_bus = i2c_bus
+        self.address = address
+        self._buffer = bytearray(1)
+        self._last_value = 0xFF
+        self.write_byte(0xFF)
+
+    def _lock(self):
+        start = time.monotonic()
+        while not self.i2c_bus.try_lock():
+            if time.monotonic() - start > 0.25:
+                raise RuntimeError("I2C lock timeout")
+            time.sleep(0.001)
+
+    def write_byte(self, value):
+        self._lock()
+        try:
+            self.i2c_bus.writeto(self.address, bytes((value & 0xFF,)))
+        finally:
+            self.i2c_bus.unlock()
+
+    def read_byte(self):
+        self._lock()
+        try:
+            self.i2c_bus.readfrom_into(self.address, self._buffer)
+        finally:
+            self.i2c_bus.unlock()
+        self._last_value = self._buffer[0]
+        return self._last_value
+
+
 def init_pcf(i2c_bus, address):
     try:
-        pcf = adafruit_pcf8574.PCF8574(i2c_bus, address=address)
-        pins = []
-        for index in range(8):
-            input_pin = pcf.get_pin(index)
-            input_pin.switch_to_input()
-            pins.append(input_pin)
-        return pcf, pins, None
+        return DirectPCF8574(i2c_bus, address), None
     except Exception as exc:
-        return None, [None] * 8, str(exc)
+        return None, str(exc)
 
 
 def init_ads(i2c_bus):
@@ -212,14 +269,10 @@ def make_input(pin):
     return dio
 
 
-def read_bit(pins, bit):
-    input_pin = pins[bit]
-    if input_pin is None:
+def read_bit(raw_value, bit):
+    if raw_value is None:
         return None
-    try:
-        return bool(input_pin.value)
-    except Exception:
-        return None
+    return bool(raw_value & (1 << bit))
 
 
 def decode_signal(raw, active_high):
@@ -228,10 +281,17 @@ def decode_signal(raw, active_high):
     return raw if active_high else not raw
 
 
-def read_signal_group(pins, configs):
+def read_signal_group(pcf, configs):
+    if pcf is None:
+        raw_value = None
+    else:
+        try:
+            raw_value = pcf.read_byte()
+        except Exception:
+            raw_value = None
     values = {}
     for config in configs:
-        raw = read_bit(pins, config["bit"])
+        raw = read_bit(raw_value, config["bit"])
         values[config["name"]] = {
             "raw": raw,
             "active": decode_signal(raw, config["active_high"]),
@@ -252,15 +312,26 @@ def voltage_to_resistance(voltage):
 
 
 def resistance_to_percent(resistance):
-    return clamp(100.0 * (1.0 - resistance / MAX_SENDER_OHMS), 0.0, 100.0)
+    return clamp(100.0 * (resistance / MAX_SENDER_OHMS), 0.0, 100.0)
 
 
 def resistance_to_oil_psi(resistance):
-    return clamp(MAX_OIL_PSI * (1.0 - resistance / MAX_SENDER_OHMS), 0.0, MAX_OIL_PSI)
+    return clamp(MAX_OIL_PSI * (resistance / MAX_SENDER_OHMS), 0.0, MAX_OIL_PSI)
 
 
 def resistance_to_coolant_f(resistance):
-    return clamp(MAX_COOLANT_F * (1.0 - resistance / MAX_SENDER_OHMS), 0.0, MAX_COOLANT_F)
+    if resistance >= GM_ECT_TABLE[0][1]:
+        return GM_ECT_TABLE[0][0]
+    if resistance <= GM_ECT_TABLE[-1][1]:
+        return GM_ECT_TABLE[-1][0]
+    for index in range(len(GM_ECT_TABLE) - 1):
+        low_temp, high_resistance = GM_ECT_TABLE[index]
+        high_temp, low_resistance = GM_ECT_TABLE[index + 1]
+        if high_resistance >= resistance >= low_resistance:
+            span = high_resistance - low_resistance
+            position = (high_resistance - resistance) / span
+            return low_temp + position * (high_temp - low_temp)
+    return None
 
 
 def read_ads_channels(ads_inputs):
@@ -476,7 +547,9 @@ class TextPage:
 
     def set_lines(self, lines):
         for index, text_line in enumerate(self.lines):
-            text_line.text = lines[index] if index < len(lines) else ""
+            next_text = lines[index] if index < len(lines) else ""
+            if text_line.text != next_text:
+                text_line.text = next_text
 
 
 class ClusterPage:
@@ -578,6 +651,7 @@ class DisplayController:
     def show_group(self, group):
         if group == self.current_group:
             return
+        gc.collect()
         try:
             self.display.root_group = group
         except AttributeError:
@@ -743,8 +817,8 @@ def run_self_test(controller):
 
 
 i2c, i2c_found = init_i2c()
-pcf_indicator, indicator_pins, pcf_indicator_error = init_pcf(i2c, PCF_INDICATOR_ADDRESS)
-pcf_warning, warning_pins, pcf_warning_error = init_pcf(i2c, PCF_WARNING_ADDRESS)
+pcf_indicator, pcf_indicator_error = init_pcf(i2c, PCF_INDICATOR_ADDRESS)
+pcf_warning, pcf_warning_error = init_pcf(i2c, PCF_WARNING_ADDRESS)
 ads, ads_inputs, ads_error = init_ads(i2c)
 display, backlight, display_error = init_display()
 
@@ -762,8 +836,8 @@ state = {
     "pcf_warning_ok": pcf_warning is not None,
     "ads_ok": ads is not None,
     "display_ok": display_error is None,
-    "indicators": read_signal_group(indicator_pins, INDICATOR_SIGNALS),
-    "warnings": read_signal_group(warning_pins, WARNING_SIGNALS),
+    "indicators": read_signal_group(pcf_indicator, INDICATOR_SIGNALS),
+    "warnings": read_signal_group(pcf_warning, WARNING_SIGNALS),
     "analog": read_ads_channels(ads_inputs),
     "prndl": "NO DATA",
     "pulses": {
@@ -821,12 +895,13 @@ while True:
             time.sleep(0.005)
         last_button_raw = True
         last_button_change = time.monotonic()
+        gc.collect()
         last_display = 0.0
 
     if now - last_pcf_poll >= PCF_POLL_INTERVAL:
         last_pcf_poll = now
-        state["indicators"] = read_signal_group(indicator_pins, INDICATOR_SIGNALS)
-        state["warnings"] = read_signal_group(warning_pins, WARNING_SIGNALS)
+        state["indicators"] = read_signal_group(pcf_indicator, INDICATOR_SIGNALS)
+        state["warnings"] = read_signal_group(pcf_warning, WARNING_SIGNALS)
         state["prndl"] = prndl_state(state["indicators"])
 
     if now - last_ads_poll >= ADS_POLL_INTERVAL:
@@ -859,12 +934,21 @@ while True:
 
     odometer.maybe_periodic_save(now, tach_running)
 
-    if now - last_display >= DISPLAY_INTERVAL:
+    display_interval = DISPLAY_INTERVAL if state["page"] == 0 else TEXT_DISPLAY_INTERVAL
+    if now - last_display >= display_interval:
         last_display = now
+        if state["page"] != 0:
+            gc.collect()
         display_controller.update(state)
+        if state["page"] != 0:
+            gc.collect()
 
     if now - last_serial >= SERIAL_INTERVAL:
         last_serial = now
-        print(json.dumps(snapshot_for_serial(state)))
+        gc.collect()
+        print("free mem:", gc.mem_free(), "loop hz:", state["loop_hz"]) #ADDED FOR DEBUGGING 06/06/2026
+#        print(json.dumps(snapshot_for_serial(state))) #COMMENTED OUT FOR DEBUGGING 06/06/2026
+#        print()
+        gc.collect()
 
     time.sleep(PULSE_POLL_INTERVAL)
