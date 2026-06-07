@@ -243,8 +243,11 @@ class DirectFRAM:
         self._lock()
         try:
             self._set_address(memory_address)
-            self.i2c_bus.writeto(self.address, self._address_buffer, stop=False)
-            self.i2c_bus.readfrom_into(self.address, buffer)
+            self.i2c_bus.writeto_then_readfrom(
+                self.address,
+                self._address_buffer,
+                buffer,
+            )
         finally:
             self.i2c_bus.unlock()
         return buffer
@@ -579,6 +582,7 @@ class Odometer:
                 self.load_ok = False
                 self.last_error = "no valid FRAM odometer record"
                 self.dirty = True
+                self.save(time.monotonic())
                 return
             latest = records[0]
             for record in records[1:]:
