@@ -1,7 +1,9 @@
 # Future Revision Notes
 
-- Replace file-based odometer persistence with FRAM-backed storage when the
-  FRAM hardware is installed.
+- Add a one-time odometer set mode for matching the truck's actual mileage:
+  `ODOMETER_FORCE_SET`, `ODOMETER_FORCE_TENTHS`, and
+  `ODOMETER_FORCE_REMAINDER_PULSES`. Boot once with force set enabled to write
+  the target mileage to FRAM, then disable it before normal use.
 - Confirm final VSS calibration. Current default is `VSS_PULSES_PER_MILE = 4000`
   and `VSS_PULSES_PER_TENTH_MILE = 400`.
 - Confirm final tach calibration. Current default is `TACH_PULSES_PER_REV = 2.0`.
