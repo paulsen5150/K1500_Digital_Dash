@@ -1,0 +1,870 @@
+"""
+Reads the interface board and display a graphical output on 2inch lcd
+
+ESP32-S3 CircuitPython instrument cluster for the K1500/KITT interface.
+
+This version keeps the hardware setup from ESP32_KITT_Display/code.py, but the
+default page is a landscape digital instrument cluster with speed, RPM, analog
+gauges, warning lamps, PRNDL, and an integer-backed odometer.
+"""
+import json
+import time
+
+import board
+import busio
+import digitalio
+import displayio
+import terminalio
+from adafruit_display_text import label
+import adafruit_ads1x15.ads1115 as ADS
+from adafruit_ads1x15.analog_in import AnalogIn
+import adafruit_pcf8574
+import adafruit_st7789
+import fourwire
+
+
+# Hardware configuration
+I2C_SCL = board.IO9
+I2C_SDA = board.IO8
+
+PCF_INDICATOR_ADDRESS = 0x20
+PCF_WARNING_ADDRESS = 0x21
+ADS_ADDRESS = 0x48
+
+TFT_SCK = board.IO12
+TFT_MOSI = board.IO11
+TFT_CS = board.IO10
+TFT_DC = board.IO13
+TFT_RST = board.IO14
+TFT_BL = board.IO21
+TFT_WIDTH = 320
+TFT_HEIGHT = 240
+TFT_ROTATION = 90
+
+PAGE_BUTTON_PIN = board.IO17
+VSS_PIN = board.IO15
+TACH_PIN = board.IO16
+
+PCF_POLL_INTERVAL = 0.05
+ADS_POLL_INTERVAL = 0.2
+PULSE_POLL_INTERVAL = 0.001
+DISPLAY_INTERVAL = 0.1
+SERIAL_INTERVAL = 1.0
+BUTTON_DEBOUNCE = 0.05
+FREQUENCY_WINDOW = 1.0
+STALE_PULSE_SECONDS = 2.0
+ENGINE_OFF_TACH_STALE_SECONDS = 5.0
+
+
+# Calibration placeholders. Adjust these after road/bench testing.
+VSS_PULSES_PER_MILE = 4000
+VSS_PULSES_PER_TENTH_MILE = 400
+TACH_PULSES_PER_REV = 2.0
+
+ODOMETER_FILE = "/odometer.json"
+ODOMETER_START_TENTHS = 2530000
+ODOMETER_START_REMAINDER_PULSES = 0
+ODOMETER_SAVE_INTERVAL_SECONDS = 60.0
+
+SUPPLY_VOLTAGE = 3.3
+SENDER_PULLUP_OHMS = 250.0
+MAX_SENDER_OHMS = 90.0
+MAX_OIL_PSI = 80.0
+MAX_COOLANT_F = 260.0
+
+LOW_FUEL_PERCENT = 12.5
+LOW_OIL_PSI = 5.0
+HIGH_COOLANT_F = 230.0
+
+
+COLOR_BG = 0x000000
+COLOR_DIM = 0x303030
+COLOR_TEXT = 0xE8E8E8
+COLOR_MUTED = 0x808080
+COLOR_GREEN = 0x00FF66
+COLOR_AMBER = 0xFFAA00
+COLOR_RED = 0xFF2020
+COLOR_BLUE = 0x2080FF
+
+
+INDICATOR_SIGNALS = (
+    {"name": "HiBeam", "bit": 0, "active_high": True},
+    {"name": "L Turn", "bit": 1, "active_high": True},
+    {"name": "R Turn", "bit": 2, "active_high": True},
+    {"name": "SeatBelts", "bit": 3, "active_high": True},
+    {"name": "PRNDL P", "bit": 4, "active_high": True},
+    {"name": "PRNDL C", "bit": 5, "active_high": True},
+    {"name": "PRNDL B", "bit": 6, "active_high": True},
+    {"name": "PRNDL A", "bit": 7, "active_high": True},
+)
+
+WARNING_SIGNALS = (
+    {"name": "ABS", "bit": 0, "active_high": False},
+    {"name": "ALT", "bit": 1, "active_high": False},
+    {"name": "AirBag", "bit": 2, "active_high": False},
+    {"name": "DRL", "bit": 3, "active_high": False},
+    {"name": "MIL", "bit": 4, "active_high": False},
+    {"name": "ParkBrake", "bit": 5, "active_high": False},
+    {"name": "Spare1", "bit": 6, "active_high": False},
+    {"name": "Spare2", "bit": 7, "active_high": False},
+)
+
+ADS_CHANNELS = (
+    {"name": "ECT", "channel": 0},
+    {"name": "OilPres", "channel": 1},
+    {"name": "Fuel", "channel": 2},
+    {"name": "ADS3", "channel": 3},
+)
+
+PRNDL_TABLE = {
+    (False, True, True, False): "P",
+    (False, False, True, True): "R",
+    (True, False, True, False): "N",
+    (True, False, False, True): "OD",
+    (False, False, False, False): "3",
+    (False, True, False, True): "2",
+    (True, True, False, False): "1",
+}
+
+
+class NullDisplay:
+    def show(self, group):
+        pass
+
+    @property
+    def root_group(self):
+        return None
+
+    @root_group.setter
+    def root_group(self, group):
+        pass
+
+
+def pin_name(pin):
+    return str(pin).split(".")[-1]
+
+
+def init_i2c():
+    i2c_bus = busio.I2C(I2C_SCL, I2C_SDA)
+    while not i2c_bus.try_lock():
+        time.sleep(0.01)
+    try:
+        found = tuple(i2c_bus.scan())
+    finally:
+        i2c_bus.unlock()
+    return i2c_bus, found
+
+
+def init_pcf(i2c_bus, address):
+    try:
+        pcf = adafruit_pcf8574.PCF8574(i2c_bus, address=address)
+        pins = []
+        for index in range(8):
+            input_pin = pcf.get_pin(index)
+            input_pin.switch_to_input()
+            pins.append(input_pin)
+        return pcf, pins, None
+    except Exception as exc:
+        return None, [None] * 8, str(exc)
+
+
+def init_ads(i2c_bus):
+    try:
+        ads = ADS.ADS1115(i2c_bus, address=ADS_ADDRESS)
+        inputs = {}
+        for channel in ADS_CHANNELS:
+            inputs[channel["name"]] = AnalogIn(ads, channel["channel"])
+        return ads, inputs, None
+    except Exception as exc:
+        return None, {}, str(exc)
+
+
+def init_display():
+    try:
+        displayio.release_displays()
+        spi = busio.SPI(TFT_SCK, MOSI=TFT_MOSI)
+        display_bus = fourwire.FourWire(
+#        display_bus = displayio.FourWire(
+            spi,
+            command=TFT_DC,
+            chip_select=TFT_CS,
+            reset=TFT_RST,
+        )
+        display = adafruit_st7789.ST7789(
+            display_bus,
+            width=TFT_WIDTH,
+            height=TFT_HEIGHT,
+            rotation=TFT_ROTATION,
+        )
+        backlight = digitalio.DigitalInOut(TFT_BL)
+        backlight.direction = digitalio.Direction.OUTPUT
+        backlight.value = True
+        return display, backlight, None
+    except Exception as exc:
+        print("Display init failed:", exc)
+        return NullDisplay(), None, str(exc)
+
+
+def make_input(pin):
+    dio = digitalio.DigitalInOut(pin)
+    dio.direction = digitalio.Direction.INPUT
+    dio.pull = digitalio.Pull.UP
+    return dio
+
+
+def read_bit(pins, bit):
+    input_pin = pins[bit]
+    if input_pin is None:
+        return None
+    try:
+        return bool(input_pin.value)
+    except Exception:
+        return None
+
+
+def decode_signal(raw, active_high):
+    if raw is None:
+        return None
+    return raw if active_high else not raw
+
+
+def read_signal_group(pins, configs):
+    values = {}
+    for config in configs:
+        raw = read_bit(pins, config["bit"])
+        values[config["name"]] = {
+            "raw": raw,
+            "active": decode_signal(raw, config["active_high"]),
+        }
+    return values
+
+
+def clamp(value, low, high):
+    return min(max(value, low), high)
+
+
+def voltage_to_resistance(voltage):
+    if voltage <= 0.0:
+        return 0.0
+    if voltage >= SUPPLY_VOLTAGE:
+        return MAX_SENDER_OHMS
+    return (voltage * SENDER_PULLUP_OHMS) / (SUPPLY_VOLTAGE - voltage)
+
+
+def resistance_to_percent(resistance):
+    return clamp(100.0 * (1.0 - resistance / MAX_SENDER_OHMS), 0.0, 100.0)
+
+
+def resistance_to_oil_psi(resistance):
+    return clamp(MAX_OIL_PSI * (1.0 - resistance / MAX_SENDER_OHMS), 0.0, MAX_OIL_PSI)
+
+
+def resistance_to_coolant_f(resistance):
+    return clamp(MAX_COOLANT_F * (1.0 - resistance / MAX_SENDER_OHMS), 0.0, MAX_COOLANT_F)
+
+
+def read_ads_channels(ads_inputs):
+    values = {}
+    for channel in ADS_CHANNELS:
+        name = channel["name"]
+        analog = ads_inputs.get(name)
+        if analog is None:
+            values[name] = {
+                "raw": None,
+                "voltage": None,
+                "resistance": None,
+                "converted": None,
+            }
+            continue
+        try:
+            voltage = analog.voltage
+            resistance = voltage_to_resistance(voltage)
+            converted = None
+            if name == "Fuel":
+                converted = resistance_to_percent(resistance)
+            elif name == "OilPres":
+                converted = resistance_to_oil_psi(resistance)
+            elif name == "ECT":
+                converted = resistance_to_coolant_f(resistance)
+            values[name] = {
+                "raw": analog.value,
+                "voltage": voltage,
+                "resistance": resistance,
+                "converted": converted,
+            }
+        except Exception:
+            values[name] = {
+                "raw": None,
+                "voltage": None,
+                "resistance": None,
+                "converted": None,
+            }
+    return values
+
+
+def prndl_state(indicators):
+    a = indicators["PRNDL A"]["active"]
+    b = indicators["PRNDL B"]["active"]
+    c = indicators["PRNDL C"]["active"]
+    p = indicators["PRNDL P"]["active"]
+    if None in (a, b, c, p):
+        return "NO DATA"
+    return PRNDL_TABLE.get((a, b, c, p), "INVALID")
+
+
+class PulseCounter:
+    def __init__(self, input_pin, name):
+        self.input_pin = input_pin
+        self.name = name
+        self.last_raw = input_pin.value
+        self.count = 0
+        self.window_count = 0
+        self.frequency = 0.0
+        self.last_edge_time = None
+        self.last_window_time = time.monotonic()
+
+    def update(self, now):
+        edge_count = 0
+        raw = self.input_pin.value
+        if self.last_raw and not raw:
+            self.count += 1
+            self.window_count += 1
+            edge_count = 1
+            self.last_edge_time = now
+        self.last_raw = raw
+
+        elapsed = now - self.last_window_time
+        if elapsed >= FREQUENCY_WINDOW:
+            self.frequency = self.window_count / elapsed
+            self.window_count = 0
+            self.last_window_time = now
+        return edge_count
+
+    def snapshot(self, now, stale_seconds=STALE_PULSE_SECONDS):
+        if self.last_edge_time is None:
+            age = None
+            stale = True
+        else:
+            age = now - self.last_edge_time
+            stale = age > stale_seconds
+        return {
+            "count": self.count,
+            "frequency_hz": self.frequency,
+            "last_edge_age": age,
+            "stale": stale,
+        }
+
+
+class Odometer:
+    def __init__(self):
+        self.tenths = ODOMETER_START_TENTHS
+        self.remainder_pulses = ODOMETER_START_REMAINDER_PULSES
+        self.load_ok = False
+        self.save_ok = False
+        self.last_error = None
+        self.last_save_time = 0.0
+        self.dirty = False
+        self.load()
+
+    def load(self):
+        try:
+            with open(ODOMETER_FILE, "r") as file_obj:
+                data = json.loads(file_obj.read())
+            tenths = int(data.get("tenths", ODOMETER_START_TENTHS))
+            remainder = int(data.get("remainder_pulses", ODOMETER_START_REMAINDER_PULSES))
+            if tenths < 0 or remainder < 0:
+                raise ValueError("negative odometer value")
+            self.tenths = tenths
+            self.remainder_pulses = remainder
+            self.normalize()
+            self.load_ok = True
+            self.last_error = None
+        except Exception as exc:
+            self.tenths = ODOMETER_START_TENTHS
+            self.remainder_pulses = ODOMETER_START_REMAINDER_PULSES
+            self.normalize()
+            self.load_ok = False
+            self.last_error = str(exc)
+
+    def normalize(self):
+        while self.remainder_pulses >= VSS_PULSES_PER_TENTH_MILE:
+            self.tenths += 1
+            self.remainder_pulses -= VSS_PULSES_PER_TENTH_MILE
+
+    def add_pulses(self, pulse_count):
+        if pulse_count <= 0:
+            return
+        self.remainder_pulses += int(pulse_count)
+        self.normalize()
+        self.dirty = True
+
+    def miles(self):
+        return self.tenths / 10.0
+
+    def formatted(self):
+        return "{:07.1f}".format(self.miles())
+
+    def save(self, now):
+        try:
+            data = {
+                "tenths": int(self.tenths),
+                "remainder_pulses": int(self.remainder_pulses),
+            }
+            with open(ODOMETER_FILE, "w") as file_obj:
+                file_obj.write(json.dumps(data))
+            self.save_ok = True
+            self.last_error = None
+            self.last_save_time = now
+            self.dirty = False
+        except Exception as exc:
+            self.save_ok = False
+            self.last_error = str(exc)
+
+    def maybe_periodic_save(self, now, running):
+        if not running or not self.dirty:
+            return
+        if now - self.last_save_time >= ODOMETER_SAVE_INTERVAL_SECONDS:
+            self.save(now)
+
+    def snapshot(self):
+        return {
+            "tenths": self.tenths,
+            "remainder_pulses": self.remainder_pulses,
+            "miles": self.miles(),
+            "load_ok": self.load_ok,
+            "save_ok": self.save_ok,
+            "last_error": self.last_error,
+        }
+
+
+def bool_text(value):
+    if value is None:
+        return "--"
+    return "HI" if value else "LO"
+
+
+def active_text(value):
+    if value is None:
+        return "--"
+    return "ON" if value else "off"
+
+
+def fmt_float(value, places=2):
+    if value is None:
+        return "--"
+    return ("{:." + str(places) + "f}").format(value)
+
+
+def fmt_int(value):
+    if value is None:
+        return "--"
+    return str(int(value))
+
+
+def make_label(text, x, y, color=COLOR_TEXT, scale=1):
+    return label.Label(terminalio.FONT, text=text, color=color, x=x, y=y, scale=scale)
+
+
+class TextPage:
+    def __init__(self):
+        self.group = displayio.Group()
+        self.lines = []
+        for index in range(14):
+            text = make_label("", 4, 9 + index * 17, COLOR_GREEN, 1)
+            self.group.append(text)
+            self.lines.append(text)
+
+    def set_lines(self, lines):
+        for index, text_line in enumerate(self.lines):
+            text_line.text = lines[index] if index < len(lines) else ""
+
+
+class ClusterPage:
+    def __init__(self):
+        self.group = displayio.Group()
+        self.lamps = {}
+        self.group.append(make_label("MPH", 42, 16, COLOR_MUTED, 1))
+        self.speed = make_label("000", 18, 63, COLOR_TEXT, 5)
+        self.group.append(self.speed)
+        self.group.append(make_label("RPM", 210, 16, COLOR_MUTED, 1))
+        self.rpm = make_label("0000", 182, 63, COLOR_TEXT, 4)
+        self.group.append(self.rpm)
+
+        self.fuel = make_label("FUEL --%", 13, 132, COLOR_GREEN, 1)
+        self.temp = make_label("TEMP ---F", 116, 132, COLOR_GREEN, 1)
+        self.oil = make_label("OIL -- PSI", 218, 132, COLOR_GREEN, 1)
+        self.prndl = make_label("PRNDL --", 13, 153, COLOR_TEXT, 1)
+        self.odo = make_label("ODO 000000.0", 107, 228, COLOR_TEXT, 1)
+        self.group.append(self.fuel)
+        self.group.append(self.temp)
+        self.group.append(self.oil)
+        self.group.append(self.prndl)
+        self.group.append(self.odo)
+
+        self.add_lamp("L", 10, 178, COLOR_GREEN)
+        self.add_lamp("HIGH", 31, 178, COLOR_BLUE)
+        self.add_lamp("R", 65, 178, COLOR_GREEN)
+        self.add_lamp("BELT", 87, 178, COLOR_RED)
+        self.add_lamp("ABS", 123, 178, COLOR_AMBER)
+        self.add_lamp("ALT", 153, 178, COLOR_RED)
+        self.add_lamp("AIR", 184, 178, COLOR_RED)
+        self.add_lamp("DRL", 214, 178, COLOR_GREEN)
+        self.add_lamp("MIL", 244, 178, COLOR_AMBER)
+        self.add_lamp("BRK", 275, 178, COLOR_RED)
+
+        self.add_lamp("S1", 10, 204, COLOR_AMBER)
+        self.add_lamp("S2", 32, 204, COLOR_AMBER)
+        self.add_lamp("LOWF", 64, 204, COLOR_AMBER)
+        self.add_lamp("OIL", 106, 204, COLOR_RED)
+        self.add_lamp("TEMP", 141, 204, COLOR_RED)
+        self.add_lamp("VSS", 184, 204, COLOR_AMBER)
+        self.add_lamp("TACH", 220, 204, COLOR_AMBER)
+
+    def add_lamp(self, name, x, y, on_color):
+        lamp = make_label(name, x, y, COLOR_DIM, 1)
+        self.lamps[name] = {"label": lamp, "on_color": on_color}
+        self.group.append(lamp)
+
+    def set_lamp(self, name, active):
+        lamp = self.lamps[name]
+        lamp["label"].color = lamp["on_color"] if active else COLOR_DIM
+
+    def update(self, state):
+        speed = state["cluster"]["speed_mph"]
+        rpm = state["cluster"]["rpm"]
+        fuel = state["cluster"]["fuel_percent"]
+        oil = state["cluster"]["oil_psi"]
+        temp = state["cluster"]["coolant_f"]
+        warnings = state["derived_warnings"]
+
+        self.speed.text = "{:03d}".format(int(clamp(speed, 0, 999)))
+        self.rpm.text = "{:04d}".format(int(clamp(rpm, 0, 9999)))
+        self.fuel.text = "FUEL {}%".format(fmt_int(fuel))
+        self.fuel.color = COLOR_AMBER if warnings["low_fuel"] else COLOR_GREEN
+        self.temp.text = "TEMP {}F".format(fmt_int(temp))
+        self.temp.color = COLOR_RED if warnings["high_coolant"] else COLOR_GREEN
+        self.oil.text = "OIL {} PSI".format(fmt_int(oil))
+        self.oil.color = COLOR_RED if warnings["low_oil"] else COLOR_GREEN
+        self.prndl.text = "PRNDL {}".format(state["prndl"])
+        self.odo.text = "ODO {}".format(state["odometer"]["display"])
+
+        self.set_lamp("L", state["indicators"]["L Turn"]["active"])
+        self.set_lamp("HIGH", state["indicators"]["HiBeam"]["active"])
+        self.set_lamp("R", state["indicators"]["R Turn"]["active"])
+        self.set_lamp("BELT", state["indicators"]["SeatBelts"]["active"])
+        self.set_lamp("ABS", state["warnings"]["ABS"]["active"])
+        self.set_lamp("ALT", state["warnings"]["ALT"]["active"])
+        self.set_lamp("AIR", state["warnings"]["AirBag"]["active"])
+        self.set_lamp("MIL", state["warnings"]["MIL"]["active"])
+        self.set_lamp("BRK", state["warnings"]["ParkBrake"]["active"])
+        self.set_lamp("DRL", state["warnings"]["DRL"]["active"])
+        self.set_lamp("S1", state["warnings"]["Spare1"]["active"])
+        self.set_lamp("S2", state["warnings"]["Spare2"]["active"])
+        self.set_lamp("LOWF", warnings["low_fuel"])
+        self.set_lamp("OIL", warnings["low_oil"])
+        self.set_lamp("TEMP", warnings["high_coolant"])
+        self.set_lamp("VSS", warnings["stale_vss"])
+        self.set_lamp("TACH", warnings["stale_tach"])
+
+
+class DisplayController:
+    def __init__(self, display):
+        self.display = display
+        self.cluster = ClusterPage()
+        self.text = TextPage()
+        self.current_group = None
+        self.show_group(self.cluster.group)
+
+    def show_group(self, group):
+        if group == self.current_group:
+            return
+        try:
+            self.display.root_group = group
+        except AttributeError:
+            self.display.show(group)
+        self.current_group = group
+
+    def update(self, state):
+        if state["page"] == 0:
+            self.show_group(self.cluster.group)
+            self.cluster.update(state)
+        else:
+            self.show_group(self.text.group)
+            self.text.set_lines(PAGES[state["page"]](state))
+
+
+def speed_from_frequency(frequency_hz):
+    return frequency_hz * 3600.0 / VSS_PULSES_PER_MILE
+
+
+def rpm_from_frequency(frequency_hz):
+    return frequency_hz * 60.0 / TACH_PULSES_PER_REV
+
+
+def derived_warning_state(state):
+    cluster = state["cluster"]
+    pulses = state["pulses"]
+    return {
+        "low_fuel": cluster["fuel_percent"] is not None and cluster["fuel_percent"] <= LOW_FUEL_PERCENT,
+        "low_oil": cluster["oil_psi"] is not None and cluster["oil_psi"] <= LOW_OIL_PSI,
+        "high_coolant": cluster["coolant_f"] is not None and cluster["coolant_f"] >= HIGH_COOLANT_F,
+        "stale_vss": pulses["VSS"]["stale"],
+        "stale_tach": pulses["Tach"]["stale"],
+    }
+
+
+def page_indicators(state):
+    lines = ["Indicators / Warnings", ""]
+    for name in ("HiBeam", "L Turn", "R Turn", "SeatBelts"):
+        item = state["indicators"][name]
+        lines.append("{} {:>3} raw {}".format(name, active_text(item["active"]), bool_text(item["raw"])))
+    lines.append("")
+    for name in ("ABS", "ALT", "AirBag", "DRL", "MIL", "ParkBrake"):
+        item = state["warnings"][name]
+        lines.append("{} {:>3} raw {}".format(name, active_text(item["active"]), bool_text(item["raw"])))
+    return lines
+
+
+def page_analog(state):
+    lines = ["ADS1115 Analog", ""]
+    for name in ("ECT", "OilPres", "Fuel", "ADS3"):
+        item = state["analog"][name]
+        lines.append(name)
+        lines.append(" raw {} V {}".format(item["raw"] if item["raw"] is not None else "--", fmt_float(item["voltage"], 3)))
+        if name == "Fuel":
+            lines.append(" fuel {}%".format(fmt_float(item["converted"], 1)))
+        elif name == "OilPres":
+            lines.append(" oil {} psi".format(fmt_float(item["converted"], 1)))
+        elif name == "ECT":
+            lines.append(" temp {}F".format(fmt_float(item["converted"], 1)))
+        else:
+            lines.append(" ohms {}".format(fmt_float(item["resistance"], 1)))
+    return lines
+
+
+def page_pulses(state):
+    vss = state["pulses"]["VSS"]
+    tach = state["pulses"]["Tach"]
+    odo = state["odometer"]
+    return [
+        "VSS / Tach / Odometer",
+        "",
+        "MPH {}".format(fmt_float(state["cluster"]["speed_mph"], 1)),
+        "VSS count {}".format(vss["count"]),
+        "VSS freq {} Hz".format(fmt_float(vss["frequency_hz"], 2)),
+        "VSS stale {}".format("YES" if vss["stale"] else "no"),
+        "",
+        "RPM {}".format(fmt_int(state["cluster"]["rpm"])),
+        "Tach count {}".format(tach["count"]),
+        "Tach freq {} Hz".format(fmt_float(tach["frequency_hz"], 2)),
+        "Tach stale {}".format("YES" if tach["stale"] else "no"),
+        "",
+        "ODO tenths {}".format(odo["tenths"]),
+        "ODO rem pulses {}".format(odo["remainder_pulses"]),
+    ]
+
+
+def page_system(state):
+    devices = ["0x{:02X}".format(item) for item in state["i2c_found"]]
+    return [
+        "System",
+        "",
+        "I2C {}".format(" ".join(devices) if devices else "none"),
+        "PCF20 {}".format("OK" if state["pcf_indicator_ok"] else "missing"),
+        "PCF21 {}".format("OK" if state["pcf_warning_ok"] else "missing"),
+        "ADS48 {}".format("OK" if state["ads_ok"] else "missing"),
+        "Display {}".format("OK" if state["display_ok"] else "fallback"),
+        "ODO load {}".format("OK" if state["odometer"]["load_ok"] else "default"),
+        "ODO save {}".format("OK" if state["odometer"]["save_ok"] else "--"),
+        "",
+        "Button {}".format(pin_name(PAGE_BUTTON_PIN)),
+        "Page {}/{}".format(state["page"] + 1, len(PAGES)),
+        "Loop {} Hz".format(fmt_float(state["loop_hz"], 1)),
+    ]
+
+
+PAGES = (None, page_indicators, page_analog, page_pulses, page_system)
+
+
+def snapshot_for_serial(state):
+    return {
+        "page": state["page"],
+        "prndl": state["prndl"],
+        "cluster": state["cluster"],
+        "derived_warnings": state["derived_warnings"],
+        "odometer": state["odometer"],
+        "indicators": state["indicators"],
+        "warnings": state["warnings"],
+        "analog": state["analog"],
+        "pulses": state["pulses"],
+        "i2c_found": state["i2c_found"],
+        "loop_hz": state["loop_hz"],
+    }
+
+
+def run_self_test(controller):
+    test_state = {
+        "page": 0,
+        "prndl": "8",
+        "cluster": {
+            "speed_mph": 188.0,
+            "rpm": 8888.0,
+            "fuel_percent": 88.0,
+            "oil_psi": 88.0,
+            "coolant_f": 188.0,
+        },
+        "derived_warnings": {
+            "low_fuel": True,
+            "low_oil": True,
+            "high_coolant": True,
+            "stale_vss": True,
+            "stale_tach": True,
+        },
+        "odometer": {"display": "888888.8"},
+        "indicators": {
+            "HiBeam": {"active": True},
+            "L Turn": {"active": True},
+            "R Turn": {"active": True},
+            "SeatBelts": {"active": True},
+        },
+        "warnings": {
+            "ABS": {"active": True},
+            "ALT": {"active": True},
+            "AirBag": {"active": True},
+            "DRL": {"active": True},
+            "MIL": {"active": True},
+            "ParkBrake": {"active": True},
+            "Spare1": {"active": True},
+            "Spare2": {"active": True},
+        },
+    }
+    controller.update(test_state)
+    time.sleep(1.0)
+
+
+i2c, i2c_found = init_i2c()
+pcf_indicator, indicator_pins, pcf_indicator_error = init_pcf(i2c, PCF_INDICATOR_ADDRESS)
+pcf_warning, warning_pins, pcf_warning_error = init_pcf(i2c, PCF_WARNING_ADDRESS)
+ads, ads_inputs, ads_error = init_ads(i2c)
+display, backlight, display_error = init_display()
+
+page_button = make_input(PAGE_BUTTON_PIN)
+vss_counter = PulseCounter(make_input(VSS_PIN), "VSS")
+tach_counter = PulseCounter(make_input(TACH_PIN), "Tach")
+odometer = Odometer()
+display_controller = DisplayController(display)
+run_self_test(display_controller)
+
+state = {
+    "page": 0,
+    "i2c_found": i2c_found,
+    "pcf_indicator_ok": pcf_indicator is not None,
+    "pcf_warning_ok": pcf_warning is not None,
+    "ads_ok": ads is not None,
+    "display_ok": display_error is None,
+    "indicators": read_signal_group(indicator_pins, INDICATOR_SIGNALS),
+    "warnings": read_signal_group(warning_pins, WARNING_SIGNALS),
+    "analog": read_ads_channels(ads_inputs),
+    "prndl": "NO DATA",
+    "pulses": {
+        "VSS": vss_counter.snapshot(time.monotonic()),
+        "Tach": tach_counter.snapshot(time.monotonic(), ENGINE_OFF_TACH_STALE_SECONDS),
+    },
+    "cluster": {
+        "speed_mph": 0.0,
+        "rpm": 0.0,
+        "fuel_percent": None,
+        "oil_psi": None,
+        "coolant_f": None,
+    },
+    "derived_warnings": {},
+    "odometer": odometer.snapshot(),
+    "loop_hz": 0.0,
+}
+state["odometer"]["display"] = odometer.formatted()
+state["derived_warnings"] = derived_warning_state(state)
+
+last_pcf_poll = 0.0
+last_ads_poll = 0.0
+last_display = 0.0
+last_serial = 0.0
+last_button_raw = page_button.value
+last_button_change = time.monotonic()
+last_loop_report = time.monotonic()
+loop_count = 0
+engine_was_running = False
+engine_shutdown_saved = False
+
+while True:
+    now = time.monotonic()
+    loop_count += 1
+
+    if now - last_loop_report >= 1.0:
+        state["loop_hz"] = loop_count / (now - last_loop_report)
+        loop_count = 0
+        last_loop_report = now
+
+    vss_edges = vss_counter.update(now)
+    tach_counter.update(now)
+    odometer.add_pulses(vss_edges)
+
+    button_raw = page_button.value
+    if button_raw != last_button_raw:
+        last_button_raw = button_raw
+        last_button_change = now
+    elif not button_raw and now - last_button_change >= BUTTON_DEBOUNCE:
+        state["page"] = (state["page"] + 1) % len(PAGES)
+        while not page_button.value:
+            now = time.monotonic()
+            odometer.add_pulses(vss_counter.update(now))
+            tach_counter.update(now)
+            time.sleep(0.005)
+        last_button_raw = True
+        last_button_change = time.monotonic()
+        last_display = 0.0
+
+    if now - last_pcf_poll >= PCF_POLL_INTERVAL:
+        last_pcf_poll = now
+        state["indicators"] = read_signal_group(indicator_pins, INDICATOR_SIGNALS)
+        state["warnings"] = read_signal_group(warning_pins, WARNING_SIGNALS)
+        state["prndl"] = prndl_state(state["indicators"])
+
+    if now - last_ads_poll >= ADS_POLL_INTERVAL:
+        last_ads_poll = now
+        state["analog"] = read_ads_channels(ads_inputs)
+
+    state["pulses"] = {
+        "VSS": vss_counter.snapshot(now),
+        "Tach": tach_counter.snapshot(now, ENGINE_OFF_TACH_STALE_SECONDS),
+    }
+
+    tach_running = not state["pulses"]["Tach"]["stale"]
+    if tach_running:
+        engine_was_running = True
+        engine_shutdown_saved = False
+    elif engine_was_running and not engine_shutdown_saved:
+        odometer.save(now)
+        engine_shutdown_saved = True
+
+    state["cluster"] = {
+        "speed_mph": speed_from_frequency(state["pulses"]["VSS"]["frequency_hz"]),
+        "rpm": rpm_from_frequency(state["pulses"]["Tach"]["frequency_hz"]),
+        "fuel_percent": state["analog"]["Fuel"]["converted"],
+        "oil_psi": state["analog"]["OilPres"]["converted"],
+        "coolant_f": state["analog"]["ECT"]["converted"],
+    }
+    state["odometer"] = odometer.snapshot()
+    state["odometer"]["display"] = odometer.formatted()
+    state["derived_warnings"] = derived_warning_state(state)
+
+    odometer.maybe_periodic_save(now, tach_running)
+
+    if now - last_display >= DISPLAY_INTERVAL:
+        last_display = now
+        display_controller.update(state)
+
+    if now - last_serial >= SERIAL_INTERVAL:
+        last_serial = now
+        print(json.dumps(snapshot_for_serial(state)))
+
+    time.sleep(PULSE_POLL_INTERVAL)

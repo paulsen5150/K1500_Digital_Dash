@@ -1,0 +1,40 @@
+Codex Chat Log - ESP32 Instrument Cluster
+
+Request:
+- Use ESP32_KITT_Display/code.py as a reference.
+- Create a separate ESP32 version that represents an instrument cluster with gauges and idiot lights.
+- Prefer a digital-first cluster layout.
+
+Decisions:
+- New folder: ESP32_Instrument_Cluster/
+- Main app file: code.py
+- Existing ESP32_KITT_Display/code.py remains untouched.
+- Display layout: landscape 320x240 ST7789.
+- Main screen priority: speed and RPM first.
+- Visual style: clean OEM dark theme.
+- Page button behavior: cluster page plus diagnostic pages.
+- MPH calibration: VSS_PULSES_PER_MILE = 4000.
+- Odometer display: bottom-center digital readout.
+
+Odometer behavior:
+- Odometer starts at 0 unless a saved file exists.
+- Odometer state is stored in /odometer.json.
+- Saved state uses integer fields:
+  - tenths: total completed 0.1-mile increments.
+  - remainder_pulses: VSS pulse count since the last completed 0.1 mile.
+- On startup, the app resumes from both saved values.
+- With 4000 VSS pulses per mile, 400 pulses equal one 0.1-mile increment.
+- The app saves periodically while tach is active.
+- The app also saves once when tach becomes stale, treating that as engine shutdown.
+- Odometer helpers are structured so file storage can later be replaced with FRAM.
+
+Implementation completed:
+- Added ESP32_Instrument_Cluster/code.py.
+- Added ESP32_Instrument_Cluster/README.md.
+- Added this chat log file.
+- Verified syntax with:
+  python3 -m py_compile ESP32_Instrument_Cluster/code.py
+
+Hardware/runtime note:
+- The code has not been tested on the ESP32-S3/ST7789 hardware in this session.
+- Next step is to copy ESP32_Instrument_Cluster/code.py to the CircuitPython board root as code.py and verify display, page button, serial JSON, and odometer saves.
