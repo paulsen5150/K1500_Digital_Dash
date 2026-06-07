@@ -1,3 +1,6 @@
+# Change log:
+# 2026-06-07: Added a persistent rule to record future code.py changes here.
+
 """
 Reads the interface board and display a graphical output on 2inch lcd
 
