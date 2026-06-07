@@ -1,3 +1,4 @@
+#06/07/2026
 # code.py Summary
 
 `code.py` is a CircuitPython instrument-cluster application for an ESP32-S3.
@@ -10,6 +11,7 @@ between a graphical cluster page and diagnostic text pages.
 - I2C runs on `board.IO9` SCL and `board.IO8` SDA.
 - PCF8574 at `0x20` reads indicator and PRNDL inputs.
 - PCF8574 at `0x21` reads warning-light inputs.
+- MB85RC256V FRAM at `0x50` stores odometer tenths and remainder pulses.
 - ADS1115 at `0x48` reads analog channels:
   - `ECT` on ADS channel 0
   - `OilPres` on ADS channel 1
@@ -20,6 +22,8 @@ between a graphical cluster page and diagnostic text pages.
 - Page button uses `IO17`.
 - VSS pulse input uses `IO15`.
 - Tach pulse input uses `IO16`.
+
+FRAM Found I2C device at 0x50
 
 ## Data Collection
 
@@ -51,8 +55,11 @@ between a graphical cluster page and diagnostic text pages.
 ## Odometer
 
 - `Odometer` stores distance as tenths of a mile plus remainder pulses.
-- It loads and saves `/odometer.json` on the CircuitPython filesystem.
-- It starts from `253000.0` miles if no valid odometer file is available.
+- It loads and saves odometer data in MB85RC256V FRAM instead of using
+  `/odometer.json`.
+- It stores two FRAM records with a magic header, sequence number, tenths,
+  remainder pulses, and checksum, then loads the newest valid record at boot.
+- It starts from `253000.0` miles if no valid FRAM odometer record is available.
 - It periodically saves while the engine is running and saves once after the
   tach signal becomes stale following prior engine activity.
 

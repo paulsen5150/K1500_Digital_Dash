@@ -30,6 +30,7 @@ I2C_SDA = board.IO8
 PCF_INDICATOR_ADDRESS = 0x20
 PCF_WARNING_ADDRESS = 0x21
 ADS_ADDRESS = 0x48
+FRAM_ADDRESS = 0x50
 
 TFT_SCK = board.IO12
 TFT_MOSI = board.IO11
@@ -74,10 +75,12 @@ VSS_PULSES_PER_MILE = 4000
 VSS_PULSES_PER_TENTH_MILE = 400
 TACH_PULSES_PER_REV = 2.0
 
-ODOMETER_FILE = "/odometer.json"
 ODOMETER_START_TENTHS = 2530000
 ODOMETER_START_REMAINDER_PULSES = 0
 ODOMETER_SAVE_INTERVAL_SECONDS = 60.0
+ODOMETER_FRAM_SLOT_SIZE = 16
+ODOMETER_FRAM_SLOTS = (0, ODOMETER_FRAM_SLOT_SIZE)
+ODOMETER_FRAM_MAGIC = b"ODO1"
 
 SUPPLY_VOLTAGE = 3.3
 SENDER_PULLUP_OHMS = 250.0
@@ -218,9 +221,58 @@ class DirectPCF8574:
         return self._last_value
 
 
+class DirectFRAM:
+    def __init__(self, i2c_bus, address):
+        self.i2c_bus = i2c_bus
+        self.address = address
+        self._address_buffer = bytearray(2)
+
+    def _lock(self):
+        start = time.monotonic()
+        while not self.i2c_bus.try_lock():
+            if time.monotonic() - start > 0.25:
+                raise RuntimeError("I2C lock timeout")
+            time.sleep(0.001)
+
+    def _set_address(self, memory_address):
+        self._address_buffer[0] = (memory_address >> 8) & 0xFF
+        self._address_buffer[1] = memory_address & 0xFF
+
+    def read(self, memory_address, length):
+        buffer = bytearray(length)
+        self._lock()
+        try:
+            self._set_address(memory_address)
+            self.i2c_bus.writeto(self.address, self._address_buffer, stop=False)
+            self.i2c_bus.readfrom_into(self.address, buffer)
+        finally:
+            self.i2c_bus.unlock()
+        return buffer
+
+    def write(self, memory_address, data):
+        buffer = bytearray(2 + len(data))
+        buffer[0] = (memory_address >> 8) & 0xFF
+        buffer[1] = memory_address & 0xFF
+        buffer[2:] = data
+        self._lock()
+        try:
+            self.i2c_bus.writeto(self.address, buffer)
+        finally:
+            self.i2c_bus.unlock()
+
+
 def init_pcf(i2c_bus, address):
     try:
         return DirectPCF8574(i2c_bus, address), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def init_fram(i2c_bus, address):
+    try:
+        fram = DirectFRAM(i2c_bus, address)
+        fram.read(0, 1)
+        return fram, None
     except Exception as exc:
         return None, str(exc)
 
@@ -426,10 +478,73 @@ class PulseCounter:
         }
 
 
+def uint32_to_bytes(value):
+    return bytes((
+        (value >> 24) & 0xFF,
+        (value >> 16) & 0xFF,
+        (value >> 8) & 0xFF,
+        value & 0xFF,
+    ))
+
+
+def uint16_to_bytes(value):
+    return bytes(((value >> 8) & 0xFF, value & 0xFF))
+
+
+def bytes_to_uint32(data, offset):
+    return (
+        (data[offset] << 24)
+        | (data[offset + 1] << 16)
+        | (data[offset + 2] << 8)
+        | data[offset + 3]
+    )
+
+
+def bytes_to_uint16(data, offset):
+    return (data[offset] << 8) | data[offset + 1]
+
+
+def odometer_checksum(data):
+    return sum(data[:14]) & 0xFFFF
+
+
+def make_odometer_record(sequence, tenths, remainder):
+    data = bytearray(ODOMETER_FRAM_SLOT_SIZE)
+    data[0:4] = ODOMETER_FRAM_MAGIC
+    data[4:8] = uint32_to_bytes(sequence)
+    data[8:12] = uint32_to_bytes(tenths)
+    data[12:14] = uint16_to_bytes(remainder)
+    data[14:16] = uint16_to_bytes(odometer_checksum(data))
+    return data
+
+
+def parse_odometer_record(data):
+    if len(data) != ODOMETER_FRAM_SLOT_SIZE:
+        return None
+    if bytes(data[0:4]) != ODOMETER_FRAM_MAGIC:
+        return None
+    expected = bytes_to_uint16(data, 14)
+    if odometer_checksum(data) != expected:
+        return None
+    sequence = bytes_to_uint32(data, 4)
+    tenths = bytes_to_uint32(data, 8)
+    remainder = bytes_to_uint16(data, 12)
+    if remainder >= VSS_PULSES_PER_TENTH_MILE:
+        return None
+    return {
+        "sequence": sequence,
+        "tenths": tenths,
+        "remainder_pulses": remainder,
+    }
+
+
 class Odometer:
-    def __init__(self):
+    def __init__(self, fram):
+        self.fram = fram
         self.tenths = ODOMETER_START_TENTHS
         self.remainder_pulses = ODOMETER_START_REMAINDER_PULSES
+        self.sequence = 0
+        self.next_slot = 0
         self.load_ok = False
         self.save_ok = False
         self.last_error = None
@@ -438,21 +553,49 @@ class Odometer:
         self.load()
 
     def load(self):
+        if self.fram is None:
+            self.tenths = ODOMETER_START_TENTHS
+            self.remainder_pulses = ODOMETER_START_REMAINDER_PULSES
+            self.sequence = 0
+            self.next_slot = 0
+            self.normalize()
+            self.load_ok = False
+            self.last_error = "FRAM missing"
+            return
         try:
-            with open(ODOMETER_FILE, "r") as file_obj:
-                data = json.loads(file_obj.read())
-            tenths = int(data.get("tenths", ODOMETER_START_TENTHS))
-            remainder = int(data.get("remainder_pulses", ODOMETER_START_REMAINDER_PULSES))
-            if tenths < 0 or remainder < 0:
-                raise ValueError("negative odometer value")
-            self.tenths = tenths
-            self.remainder_pulses = remainder
+            records = []
+            for slot_index, slot_address in enumerate(ODOMETER_FRAM_SLOTS):
+                data = self.fram.read(slot_address, ODOMETER_FRAM_SLOT_SIZE)
+                record = parse_odometer_record(data)
+                if record is not None:
+                    record["slot_index"] = slot_index
+                    records.append(record)
+            if not records:
+                self.tenths = ODOMETER_START_TENTHS
+                self.remainder_pulses = ODOMETER_START_REMAINDER_PULSES
+                self.sequence = 0
+                self.next_slot = 0
+                self.normalize()
+                self.load_ok = False
+                self.last_error = "no valid FRAM odometer record"
+                self.dirty = True
+                return
+            latest = records[0]
+            for record in records[1:]:
+                if record["sequence"] > latest["sequence"]:
+                    latest = record
+            self.tenths = latest["tenths"]
+            self.remainder_pulses = latest["remainder_pulses"]
+            self.sequence = latest["sequence"]
+            self.next_slot = 1 - latest["slot_index"]
             self.normalize()
             self.load_ok = True
             self.last_error = None
         except Exception as exc:
             self.tenths = ODOMETER_START_TENTHS
             self.remainder_pulses = ODOMETER_START_REMAINDER_PULSES
+            self.sequence = 0
+            self.next_slot = 0
             self.normalize()
             self.load_ok = False
             self.last_error = str(exc)
@@ -476,13 +619,19 @@ class Odometer:
         return "{:07.1f}".format(self.miles())
 
     def save(self, now):
+        if self.fram is None:
+            self.save_ok = False
+            self.last_error = "FRAM missing"
+            return
         try:
-            data = {
-                "tenths": int(self.tenths),
-                "remainder_pulses": int(self.remainder_pulses),
-            }
-            with open(ODOMETER_FILE, "w") as file_obj:
-                file_obj.write(json.dumps(data))
+            self.sequence = (self.sequence + 1) & 0xFFFFFFFF
+            data = make_odometer_record(
+                self.sequence,
+                int(self.tenths),
+                int(self.remainder_pulses),
+            )
+            self.fram.write(ODOMETER_FRAM_SLOTS[self.next_slot], data)
+            self.next_slot = 1 - self.next_slot
             self.save_ok = True
             self.last_error = None
             self.last_save_time = now
@@ -747,6 +896,7 @@ def page_system(state):
         "PCF20 {}".format("OK" if state["pcf_indicator_ok"] else "missing"),
         "PCF21 {}".format("OK" if state["pcf_warning_ok"] else "missing"),
         "ADS48 {}".format("OK" if state["ads_ok"] else "missing"),
+        "FRAM50 {}".format("OK" if state["fram_ok"] else "missing"),
         "Display {}".format("OK" if state["display_ok"] else "fallback"),
         "ODO load {}".format("OK" if state["odometer"]["load_ok"] else "default"),
         "ODO save {}".format("OK" if state["odometer"]["save_ok"] else "--"),
@@ -819,13 +969,14 @@ def run_self_test(controller):
 i2c, i2c_found = init_i2c()
 pcf_indicator, pcf_indicator_error = init_pcf(i2c, PCF_INDICATOR_ADDRESS)
 pcf_warning, pcf_warning_error = init_pcf(i2c, PCF_WARNING_ADDRESS)
+fram, fram_error = init_fram(i2c, FRAM_ADDRESS)
 ads, ads_inputs, ads_error = init_ads(i2c)
 display, backlight, display_error = init_display()
 
 page_button = make_input(PAGE_BUTTON_PIN)
 vss_counter = PulseCounter(make_input(VSS_PIN), "VSS")
 tach_counter = PulseCounter(make_input(TACH_PIN), "Tach")
-odometer = Odometer()
+odometer = Odometer(fram)
 display_controller = DisplayController(display)
 run_self_test(display_controller)
 
@@ -834,6 +985,7 @@ state = {
     "i2c_found": i2c_found,
     "pcf_indicator_ok": pcf_indicator is not None,
     "pcf_warning_ok": pcf_warning is not None,
+    "fram_ok": fram is not None,
     "ads_ok": ads is not None,
     "display_ok": display_error is None,
     "indicators": read_signal_group(pcf_indicator, INDICATOR_SIGNALS),
