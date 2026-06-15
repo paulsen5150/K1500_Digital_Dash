@@ -5,11 +5,17 @@ import pygame
 #   Screen Size
 window_width, window_height = 1000, 300
 #window_width, window_height = 1920, 720
-#gauge_window = pygame.display.set_mode((window_width, window_height), pygame.FULLSCREEN)
-gauge_window = pygame.display.set_mode((window_width, window_height), pygame.RESIZABLE)
-pygame.display.set_caption('Chevrolet K1500')
 
-backGround_image = 'Images/splash2.png'
+gauge_window = pygame.display.set_mode((window_width, window_height), pygame.FULLSCREEN)
+
+#gauge_window = pygame.display.set_mode((window_width, window_height), pygame.RESIZABLE)
+#test_window = pygame.display.set_mode((400, 400)) #TEMPORARY TRYOUT
+
+#pygame.display.set_caption('Chevrolet K1500')
+pygame.display.set_caption('K.I.T.T K1500 Intellegent Truck Technology')
+
+#backGround_image = 'Images/splash2.png'
+backGround_image = 'Images/KITT_Splash-09.png'
 Icon_image = 'Images/speedometer.png'
 Icon = pygame.image.load(Icon_image).convert()
 pygame.display.set_icon(Icon)
@@ -31,9 +37,9 @@ mil_state = False
 alt_state = False
 glow_state = False
 speed_status = 55
-tach_status = 1700
+tach_status = 2000
 fuel_status = 73
-coolant_status = 0
+coolant_status = 90
 voltage_status = 14.2
 oil_status = 54
 
@@ -56,28 +62,37 @@ FONT_SMALL = 25     #   Odo Size
 
 
 #   Locations for gauge graphics, each has the same start XY but builds upon it, check images folder
-RPM_XY = (585, 230)
+#RPM_XY = (585, 230)
+RPM_XY = (window_width*.585, 230)
+
 #COOLANT_XY = (1481, 105)
 #EGT_XY = (1599, 105)
-OILPRESSURE_XY = (60, 25)
+#OILPRESSURE_XY = (60, 25)
+#OILPRESSURE_XY = (0, 25)
 #BOOST_XY = (1822, 105)
 #CLOCK_XY = (555, 620)
-FUEL_XY = (925, 75)
+#FUEL_XY = (925, 75)
+FUEL_XY = (window_width*.925, 75)
 #ODO_XY = (60, 644)
 #ODO_L_XY = (395, 678)
 #MFA_XY = (1435, 668)
 #MFABG_XY = (1021, 563)
-SPEEDO_XY = (570 , 55)
-COOLANT_XY =(170, 215)
-VOLTAGE_XY = (925, 215)
-OIL_XY = (170, 75)
+#SPEEDO_XY = (570 , 55)
+SPEEDO_XY = (window_width*.57 , 55)
+#COOLANT_XY =(170, 215)
+COOLANT_XY =(window_width*.17, 215)
+#VOLTAGE_XY = (925, 215)
+VOLTAGE_XY = (window_width*.925, 215)
+#OIL_XY = (170, 75)
+OIL_XY = (window_width*.17, 75)
 OIL_LABEL_XY = (60, 25)
 COOLANT_LABEL_XY = (40, 162)
+#COOLANT_LABEL_XY = (window_width*.4, 162)
 VOLTAGE_LABEL_XY = (835, 162)
 FUEL_LABEL_XY = (815, 25)
 SPEED_LABEL_XY = (560, 10)
 TACH_LABEL_XY = (580, 240)
-
+#TACH_LABEL_XY = (window_width/2, 240)
 
 
 

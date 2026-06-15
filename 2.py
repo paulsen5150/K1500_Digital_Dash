@@ -95,12 +95,12 @@ def draw_gauge_panel():
 #    draw_speedometer_text()
 #    draw_tach_text()
     draw_labels()
-    oil.draw()
-    voltage.draw()
-    coolant.draw()
-    fuel.draw()
-    tach.draw()
-    speed.draw()
+    oil.draw(oil_status)
+    voltage.draw(voltage_status)
+    coolant.draw(coolant_status)
+    fuel.draw(fuel_status)
+    tach.draw(tach_status)
+    speed.draw(speed_status)
 
 # Creating a bool value which checks if 
 # game is running
